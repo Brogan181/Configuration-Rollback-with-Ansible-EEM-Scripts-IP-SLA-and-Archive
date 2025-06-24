@@ -1,0 +1,98 @@
+- name: Reconfigure / Rollback Interface g0/0 Config Using Archive & Configure Replace
+  hosts: router-3
+  gather_facts: false
+
+  vars:
+    eem_applet_name: "defaultIntEEMApplet"
+    revert_eem_applet_name: "revertDefaultIntEEMApplet"
+    archive_path: "flash:/r3-archive-configs"
+
+  tasks:
+    - name: Create Archive Backup (wr)
+      ios_command:
+        commands:
+          - wr
+      register: archiveBackupOutput
+
+    - name: List Archive Files
+      ios_command:
+        commands:
+          - dir {{ archive_path }}
+      register: archiveFilesOutput
+
+    - name: DEBUG - Show Archive Directory Output
+      debug:
+        var: archiveFilesOutput.stdout_lines
+
+    - name: Truncate Archive File Names
+      set_fact:
+        archive_files: "{{ archiveFilesOutput.stdout_lines[0] 
+          | select('search', 'r3-config-') 
+          | map('regex_replace', '^.* (r3-config-[^ ]+)$', '\\1')
+          | list }}"
+
+    - name: DEBUG - Show Truncated File Names
+      debug:
+        msg: "Extracted Archive Files: {{ archive_files }}"
+
+    - name: Extract Archive Sequence Numbers and Select the Highest
+      set_fact:
+        latest_backup: "{{ archive_files | map('regex_replace', '.*-(\\d+)$', '\\1') | map('int') | max | default(0) }}"
+
+    - name: DEBUG - Show Latest Archive Sequence
+      debug:
+        msg: "Latest Archive Sequence: {{ latest_backup }}"
+
+    - name: Set rollback_config variable to the Latest Archive Backup
+      set_fact:
+        rollback_config: "{{ archive_files | select('search', 'r3-config-.*-' + latest_backup|string) | first | default('') }}"
+
+    - name: DEBUG - Show rollback_config Variable
+      debug:
+        msg: "Rollback Config: {{ rollback_config }}"
+    
+    - name: Create IP SLA to Detect Unreachable State
+      ios_config:
+        commands:
+          - ip sla 99
+          - icmp-echo 10.64.0.2 # g0/1 R1
+          - frequency 10
+          - exit
+          - ip sla schedule 99 start-time now life forever
+          - track 99 ip sla 99 reachability
+          - delay down 50
+          - exit
+      register: createIpSlaOutput
+
+    - name: Create EEM Applet to Revert Changes Using Latest Archive Backup
+      ios_config:
+        commands:
+          - event manager applet {{ revert_eem_applet_name }}
+          - event track 99 state down
+          - action 1.1 cli command "enable"
+          - action 1.2 cli command "configure replace {{ archive_path }}/{{ rollback_config }} force"
+          - action 1.3 syslog priority 3 msg "The EEM Applet {{ revert_eem_applet_name }} was run"
+      register: eemRevertAppletOutput
+    
+    - name: Create EEM Applet to Default g0/0
+      ios_config:
+        commands:
+          - event manager applet {{ eem_applet_name }}
+          - event none
+          - action 1.0 cli command "enable"
+          - action 1.1 cli command "conf t"
+          - action 1.2 cli command "default int g0/0"
+          - action 1.3 syslog priority 3 msg "The EEM Applet {{ eem_applet_name }} was run"
+      register: eemAppletCreationOutput
+    
+    - name: Execute the EEM Applet to Default g0/0 Config
+      ios_command:
+        commands:
+          - event manager run {{ eem_applet_name }}
+      
+    - name: Remove EEM Applet
+      ios_config:
+        commands:
+          - no event manager applet {{ eem_applet_name }} 
+        register: eemAppletRemovalOutput
+
